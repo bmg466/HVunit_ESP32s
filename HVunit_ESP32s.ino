@@ -14,11 +14,16 @@
 //   GPIO2         -> onboard LED
 //   HV module supply: regulated 3.3 V from ESP32 board
 //
-// NOTE: With RMON=6.2k, MON node reaches 3.3 V at about 2.66 mA
-// APD/SiPM current. Do not exceed the analog front-end input limits.
+// HV calibration v1: 2026-08-14
+// Based on measured DAC code / real HV / ESP32 VADC data.
+// Current calibration remains theoretical until Keithley 6485 data
+// are collected with the 47.22 kOhm load.
 // ============================================================
 
-// ---------------- Wi-Fi ----------------
+// ============================================================
+// Wi-Fi
+// ============================================================
+
 const char* AP_SSID     = "SiPM-HV";
 const char* AP_PASSWORD = "sipm1234";
 
@@ -28,67 +33,170 @@ IPAddress AP_SUBNET(255, 255, 255, 0);
 
 WebServer server(80);
 
-// ---------------- Pins ----------------
-const uint8_t CTRL_DAC_PIN = 25;
+
+// ============================================================
+// Pins
+// ============================================================
+
+const uint8_t CTRL_DAC_PIN = 25;   // DAC1
 const uint8_t SHDN_PIN     = 27;
-const uint8_t VSENSE_PIN   = 34;
-const uint8_t ISENSE_PIN   = 35;
+const uint8_t VSENSE_PIN   = 34;   // ADC1
+const uint8_t ISENSE_PIN   = 35;   // ADC1
 const uint8_t HV_LED_PIN   = 2;
 
 // Change to false if the onboard LED works inverted.
 const bool LED_ACTIVE_HIGH = true;
 
-// ---------------- HV range ----------------
+
+// ============================================================
+// HV operating range
+// ============================================================
+
 const float HV_MIN = 0.0f;
 const float HV_MAX = 80.0f;
 
-// ---------------- Power ----------------
-// Informational value only. The control algorithm does not use it.
+// Informational only.
 const float HV_MODULE_SUPPLY_V = 3.30f;
 
-// ---------------- DAC / CTRL ----------------
-// ESP32 DAC is 8-bit. Full-scale voltage is only a nominal starting
-// value and will be replaced/compensated after calibration.
-const float DAC_FULL_SCALE_V = 3.30f;
-const float CTRL_DIVIDER     = 0.5f;   // 10k / 10k
 
-// LT3482 FB divider: 1M / 14k
-const float FB_R_TOP    = 1000000.0f;
-const float FB_R_BOTTOM =   14000.0f;
+// ============================================================
+// HV SET calibration: requested voltage -> DAC code
+// ============================================================
+//
+// Original bench measurements, no external load:
+//
+// DAC   real HV [V]
+//   0      0.10
+//  21     11.48
+//  43     21.30
+//  64     31.25
+//  85     40.81
+// 107     50.40
+// 128     59.40
+// 149     68.90
+// 171     78.50
+//
+// voltageToDac() performs inverse piecewise-linear interpolation.
+// For 78.5...80 V the last measured segment is extrapolated.
+// Approximate resulting codes:
+// 10V->18, 20V->40, 30V->61, 40V->83,
+// 50V->106, 60V->129, 70V->152, 80V->174.
+//
+// This approach deliberately avoids relying on an ideal 3.300 V DAC
+// full scale or ideal resistor values.
+// ============================================================
 
-// Calibration placeholder.
-const float DAC_CALIBRATION = 1.0000f;
+const uint8_t HV_DAC_CAL_POINTS = 9;
 
-// ---------------- V_SENSE ----------------
-// HV -> 1M -> sense node -> 33k -> GND -> buffer -> GPIO34
-const float VSENSE_R_TOP    = 1000000.0f;
-const float VSENSE_R_BOTTOM =   33000.0f;
-const float HV_CALIBRATION  = 1.0000f;
+const float HV_DAC_CAL_VOLTAGE[HV_DAC_CAL_POINTS] = {
+   0.10f,
+  11.48f,
+  21.30f,
+  31.25f,
+  40.81f,
+  50.40f,
+  59.40f,
+  68.90f,
+  78.50f
+};
 
-// ---------------- I_SENSE ----------------
-// LT3482 IMON = 0.20 * I_APD
-// MON -> 6.2k -> GND, buffer -> GPIO35
-// No additional divider between I_SENSE buffer and GPIO35.
+const uint8_t HV_DAC_CAL_CODE[HV_DAC_CAL_POINTS] = {
+    0,
+   21,
+   43,
+   64,
+   85,
+  107,
+  128,
+  149,
+  171
+};
+
+
+// ============================================================
+// HV MEASUREMENT calibration
+// ============================================================
+//
+// ESP32 analogReadMilliVolts(GPIO34) was compared against real HV.
+// The 10...80 V points give:
+//
+// real_HV[V] = HV_ADC_GAIN * VADC[mV] + HV_ADC_OFFSET
+//
+// Fit:
+//   gain   = 0.03044587 V/mV
+//   offset = 0.701281 V
+//
+// At the bottom of the ADC_ATTEN_DB_11 range the ESP32 calibration
+// function reports about 142 mV even when raw ADC code is zero.
+// Therefore raw ADC is used for zero detection before applying
+// the calibrated line.
+// ============================================================
+
+const float HV_ADC_GAIN_V_PER_MV = 0.03044587f;
+const float HV_ADC_OFFSET_V      = 0.701281f;
+
+// Raw <= this value is treated as zero voltage.
+// Working HV range is 10...80 V, so this does not affect normal use.
+const uint16_t VSENSE_ZERO_RAW_MAX = 10;
+
+
+// ============================================================
+// I_SENSE
+// ============================================================
+//
+// LT3482:
+//   IMON = 0.20 * I_APD
+//
+// Hardware:
+//   MON -> 6.2k -> GND
+//   MON -> AD8606 buffer -> GPIO35
+//
+// No additional divider at GPIO35.
+//
+// Current calibration is still theoretical. It will be replaced
+// after the Keithley 6485 + 47.22 kOhm calibration run.
+// ============================================================
+
 const float R_MON               = 6200.0f;
 const float MON_CURRENT_RATIO   = 0.20f;
 const float ISENSE_ADC_DIVIDER  = 1.0f;
 const float CURRENT_CALIBRATION = 1.0000f;
 
-// ---------------- ADC filtering ----------------
-// Stage 1: average multiple conversions.
-// Stage 2: IIR low-pass filter for displayed voltage/current.
+// Same low-end ADC issue as V_SENSE.
+const uint16_t ISENSE_ZERO_RAW_MAX = 10;
+
+
+// ============================================================
+// ADC filtering
+// ============================================================
+//
+// Stage 1: average 32 samples.
+// Stage 2: IIR low-pass for displayed HV/current.
+//
+// The gray ADC codes shown on the web page are the averaged raw
+// values BEFORE the IIR filter and are intended for calibration logs.
+// ============================================================
+
 const uint8_t ADC_SAMPLES = 32;
 const uint16_t ADC_SAMPLE_DELAY_US = 150;
 const unsigned long ADC_INTERVAL_MS = 100;
 const float ADC_FILTER_ALPHA = 0.10f;
 
-// ---------------- DAC ramp ----------------
+
+// ============================================================
+// DAC ramp
+// ============================================================
+
 const unsigned long DAC_RAMP_INTERVAL_MS = 10;
 
-// ---------------- Runtime ----------------
+
+// ============================================================
+// Runtime
+// ============================================================
+
 float setVoltage      = 0.0f;
 float measuredVoltage = 0.0f;
-float measuredCurrent = 0.0f; // mA
+float measuredCurrent = 0.0f;   // mA
 
 uint16_t vSenseRaw        = 0;
 uint16_t iSenseRaw        = 0;
@@ -104,16 +212,19 @@ bool firstAdcMeasurement = true;
 unsigned long lastAdcTime  = 0;
 unsigned long lastRampTime = 0;
 
+
 struct AdcSample {
   uint16_t raw;
   uint16_t millivolts;
 };
 
+
 // ============================================================
-// Helpers
+// LED
 // ============================================================
 
-void setHVLed(bool state) {
+void setHVLed(bool state)
+{
   if (LED_ACTIVE_HIGH) {
     digitalWrite(HV_LED_PIN, state ? HIGH : LOW);
   } else {
@@ -121,7 +232,13 @@ void setHVLed(bool state) {
   }
 }
 
-AdcSample readAdcAverage(uint8_t pin) {
+
+// ============================================================
+// ADC averaging
+// ============================================================
+
+AdcSample readAdcAverage(uint8_t pin)
+{
   uint32_t rawSum = 0;
   uint32_t mvSum  = 0;
 
@@ -132,116 +249,253 @@ AdcSample readAdcAverage(uint8_t pin) {
   }
 
   AdcSample result;
-  result.raw = (uint16_t)roundf((float)rawSum / ADC_SAMPLES);
-  result.millivolts = (uint16_t)roundf((float)mvSum / ADC_SAMPLES);
+
+  result.raw =
+      (uint16_t)roundf((float)rawSum / ADC_SAMPLES);
+
+  result.millivolts =
+      (uint16_t)roundf((float)mvSum / ADC_SAMPLES);
+
   return result;
 }
 
-uint8_t voltageToDac(float voltage) {
+
+// ============================================================
+// Requested HV -> calibrated DAC code
+// ============================================================
+
+uint8_t voltageToDac(float voltage)
+{
   voltage = constrain(voltage, HV_MIN, HV_MAX);
 
-  const float feedbackGain = 1.0f + FB_R_TOP / FB_R_BOTTOM;
-  float requiredCtrl = voltage / feedbackGain;
-  float requiredDacVoltage = requiredCtrl / CTRL_DIVIDER;
-  requiredDacVoltage *= DAC_CALIBRATION;
+  // OFF / zero request.
+  if (voltage <= 0.0f) {
+    return 0;
+  }
 
-  float code = requiredDacVoltage / DAC_FULL_SCALE_V * 255.0f;
-  code = constrain(code, 0.0f, 255.0f);
-  return (uint8_t)roundf(code);
+  // Below the first measured HV point use DAC=0.
+  if (voltage <= HV_DAC_CAL_VOLTAGE[0]) {
+    return HV_DAC_CAL_CODE[0];
+  }
+
+  // Piecewise interpolation inside the measured range.
+  for (uint8_t i = 1; i < HV_DAC_CAL_POINTS; i++) {
+    if (voltage <= HV_DAC_CAL_VOLTAGE[i]) {
+      float v0 = HV_DAC_CAL_VOLTAGE[i - 1];
+      float v1 = HV_DAC_CAL_VOLTAGE[i];
+
+      float c0 = (float)HV_DAC_CAL_CODE[i - 1];
+      float c1 = (float)HV_DAC_CAL_CODE[i];
+
+      float fraction = (voltage - v0) / (v1 - v0);
+      float code = c0 + fraction * (c1 - c0);
+
+      return (uint8_t)constrain((int)roundf(code), 0, 255);
+    }
+  }
+
+  // 78.5...80 V: extrapolate using the final measured segment.
+  const uint8_t i1 = HV_DAC_CAL_POINTS - 1;
+  const uint8_t i0 = HV_DAC_CAL_POINTS - 2;
+
+  float v0 = HV_DAC_CAL_VOLTAGE[i0];
+  float v1 = HV_DAC_CAL_VOLTAGE[i1];
+  float c0 = (float)HV_DAC_CAL_CODE[i0];
+  float c1 = (float)HV_DAC_CAL_CODE[i1];
+
+  float code = c1 +
+      (voltage - v1) * (c1 - c0) / (v1 - v0);
+
+  return (uint8_t)constrain((int)roundf(code), 0, 255);
 }
 
-void updateDacRamp() {
-  if (!hvEnabled) return;
+
+// ============================================================
+// DAC ramp
+// ============================================================
+
+void updateDacRamp()
+{
+  if (!hvEnabled) {
+    return;
+  }
 
   unsigned long now = millis();
-  if (now - lastRampTime < DAC_RAMP_INTERVAL_MS) return;
+
+  if (now - lastRampTime < DAC_RAMP_INTERVAL_MS) {
+    return;
+  }
+
   lastRampTime = now;
 
   if (currentDacCode < targetDacCode) {
-    ++currentDacCode;
+    currentDacCode++;
     dacWrite(CTRL_DAC_PIN, currentDacCode);
-  } else if (currentDacCode > targetDacCode) {
-    --currentDacCode;
+  }
+  else if (currentDacCode > targetDacCode) {
+    currentDacCode--;
     dacWrite(CTRL_DAC_PIN, currentDacCode);
   }
 }
 
-void turnHVOn() {
-  // Safe ramp from zero every time HV is enabled.
+
+// ============================================================
+// HV ON / OFF
+// ============================================================
+
+void turnHVOn()
+{
+  // Always ramp from zero when enabling HV.
   currentDacCode = 0;
   dacWrite(CTRL_DAC_PIN, 0);
+
   targetDacCode = voltageToDac(setVoltage);
 
   digitalWrite(SHDN_PIN, HIGH);
+
   hvEnabled = true;
   setHVLed(true);
 
-  Serial.printf("HV ON | SET %.2f V | DAC target %u\n", setVoltage, targetDacCode);
+  Serial.printf(
+      "HV ON | SET %.2f V | calibrated DAC target %u\n",
+      setVoltage,
+      targetDacCode
+  );
 }
 
-void turnHVOff() {
-  // Hardware shutdown first, then remove CTRL.
+
+void turnHVOff()
+{
+  // Hardware shutdown first.
   digitalWrite(SHDN_PIN, LOW);
+
+  // Then remove CTRL.
   dacWrite(CTRL_DAC_PIN, 0);
 
   currentDacCode = 0;
   targetDacCode  = 0;
+
   hvEnabled = false;
   setHVLed(false);
 
   Serial.println("HV OFF");
 }
 
-void applySetVoltage() {
+
+void applySetVoltage()
+{
   targetDacCode = voltageToDac(setVoltage);
-  Serial.printf("SET %.2f V | DAC target %u\n", setVoltage, targetDacCode);
+
+  Serial.printf(
+      "SET %.2f V | calibrated DAC target %u\n",
+      setVoltage,
+      targetDacCode
+  );
 }
 
-void updateMeasurements() {
+
+// ============================================================
+// Measurements
+// ============================================================
+
+void updateMeasurements()
+{
   unsigned long now = millis();
-  if (now - lastAdcTime < ADC_INTERVAL_MS) return;
+
+  if (now - lastAdcTime < ADC_INTERVAL_MS) {
+    return;
+  }
+
   lastAdcTime = now;
 
-  // -------- Voltage --------
+
+  // ----------------------------------------------------------
+  // V_SENSE
+  // ----------------------------------------------------------
+
   AdcSample voltageSample = readAdcAverage(VSENSE_PIN);
+
   vSenseRaw = voltageSample.raw;
   vSenseMilliVolts = voltageSample.millivolts;
 
-  float vSense = (float)vSenseMilliVolts / 1000.0f;
-  const float voltageSenseGain =
-      (VSENSE_R_TOP + VSENSE_R_BOTTOM) / VSENSE_R_BOTTOM;
+  float newMeasuredVoltage;
 
-  float newMeasuredVoltage = vSense * voltageSenseGain * HV_CALIBRATION;
-  newMeasuredVoltage = constrain(newMeasuredVoltage, 0.0f, 100.0f);
+  if (vSenseRaw <= VSENSE_ZERO_RAW_MAX) {
+    newMeasuredVoltage = 0.0f;
+  }
+  else {
+    newMeasuredVoltage =
+        HV_ADC_GAIN_V_PER_MV * (float)vSenseMilliVolts +
+        HV_ADC_OFFSET_V;
 
-  // -------- Current --------
+    newMeasuredVoltage =
+        constrain(newMeasuredVoltage, 0.0f, 100.0f);
+  }
+
+
+  // ----------------------------------------------------------
+  // I_SENSE
+  // ----------------------------------------------------------
+
   AdcSample currentSample = readAdcAverage(ISENSE_PIN);
+
   iSenseRaw = currentSample.raw;
   iSenseMilliVolts = currentSample.millivolts;
 
-  float iSense = (float)iSenseMilliVolts / 1000.0f;
-  float monVoltage = iSense / ISENSE_ADC_DIVIDER;
-  float iApdAmpere = monVoltage / R_MON / MON_CURRENT_RATIO;
-  float newMeasuredCurrent =
-      iApdAmpere * 1000.0f * CURRENT_CALIBRATION;
+  float newMeasuredCurrent;
 
-  if (newMeasuredCurrent < 0.0f) newMeasuredCurrent = 0.0f;
+  if (iSenseRaw <= ISENSE_ZERO_RAW_MAX) {
+    // Prevent the ESP32 low-end ADC calibration offset (~142 mV)
+    // from appearing as a false current.
+    newMeasuredCurrent = 0.0f;
+  }
+  else {
+    float iSenseVoltage =
+        (float)iSenseMilliVolts / 1000.0f;
 
-  // -------- IIR filtering --------
+    float monVoltage =
+        iSenseVoltage / ISENSE_ADC_DIVIDER;
+
+    float iApdAmpere =
+        monVoltage / R_MON / MON_CURRENT_RATIO;
+
+    newMeasuredCurrent =
+        iApdAmpere * 1000.0f * CURRENT_CALIBRATION;
+
+    if (newMeasuredCurrent < 0.0f) {
+      newMeasuredCurrent = 0.0f;
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // IIR low-pass filtering
+  // ----------------------------------------------------------
+
   if (firstAdcMeasurement) {
     measuredVoltage = newMeasuredVoltage;
     measuredCurrent = newMeasuredCurrent;
     firstAdcMeasurement = false;
-  } else {
-    measuredVoltage += ADC_FILTER_ALPHA *
-                       (newMeasuredVoltage - measuredVoltage);
-    measuredCurrent += ADC_FILTER_ALPHA *
-                       (newMeasuredCurrent - measuredCurrent);
+  }
+  else {
+    measuredVoltage +=
+        ADC_FILTER_ALPHA *
+        (newMeasuredVoltage - measuredVoltage);
+
+    measuredCurrent +=
+        ADC_FILTER_ALPHA *
+        (newMeasuredCurrent - measuredCurrent);
   }
 
-  if (measuredVoltage < 0.05f) measuredVoltage = 0.0f;
-  if (measuredCurrent < 0.002f) measuredCurrent = 0.0f;
+  if (measuredVoltage < 0.05f) {
+    measuredVoltage = 0.0f;
+  }
+
+  if (measuredCurrent < 0.002f) {
+    measuredCurrent = 0.0f;
+  }
 }
+
 
 // ============================================================
 // Web page
@@ -254,6 +508,7 @@ const char PAGE[] PROGMEM = R"rawliteral(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
 <title>SiPM HV</title>
+
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;width:100%;min-height:100%;background:#111315;color:white;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
@@ -286,8 +541,10 @@ button.on{background:#28d365;color:#071d0e}
 .diagTitle{margin-bottom:3px;color:#45484a;font-size:9px;letter-spacing:1.2px}
 </style>
 </head>
+
 <body>
 <div class="container">
+
   <div class="title">SiPM HIGH VOLTAGE</div>
 
   <div id="circle" class="circle">
@@ -317,12 +574,13 @@ button.on{background:#28d365;color:#071d0e}
   <button id="powerButton" onclick="togglePower()">TURN ON</button>
 
   <div class="diagnostics">
-    <div class="diagTitle">CALIBRATION DATA</div>
+    <div class="diagTitle">CALIBRATION DATA · HV CAL V1</div>
     <div>DAC: <span id="dacCurrent">0</span> &nbsp; TARGET: <span id="dacTarget">0</span></div>
     <div>ADC V: <span id="adcV">0</span> &nbsp;&nbsp; ADC I: <span id="adcI">0</span></div>
     <div>VADC: <span id="vadcMv">0</span> mV &nbsp;&nbsp; IADC: <span id="iadcMv">0</span> mV</div>
     <div>HV MODULE: 3.3 V &nbsp; ESP32 · LT3482</div>
   </div>
+
 </div>
 
 <script>
@@ -331,14 +589,22 @@ let firstStateReceived=false;
 
 function updateScreen(data){
   hvOn=data.enabled;
-  document.getElementById("voltageDisplay").innerText=Number(data.measuredVoltage).toFixed(1);
-  document.getElementById("currentDisplay").innerText=Number(data.measuredCurrent).toFixed(3);
-  document.getElementById("setInfo").innerText="SET: "+Number(data.setVoltage).toFixed(1)+" V";
+
+  document.getElementById("voltageDisplay").innerText=
+    Number(data.measuredVoltage).toFixed(1);
+
+  document.getElementById("currentDisplay").innerText=
+    Number(data.measuredCurrent).toFixed(3);
+
+  document.getElementById("setInfo").innerText=
+    "SET: "+Number(data.setVoltage).toFixed(1)+" V";
 
   const input=document.getElementById("voltageInput");
+
   if(!firstStateReceived || document.activeElement!==input){
     input.value=Number(data.setVoltage).toFixed(1);
   }
+
   firstStateReceived=true;
 
   document.getElementById("dacCurrent").innerText=data.dacCurrent;
@@ -357,7 +623,8 @@ function updateScreen(data){
     button.classList.add("on");
     status.innerText=data.ramping ? "RAMP" : "ON";
     button.innerText="TURN OFF";
-  }else{
+  }
+  else{
     circle.classList.remove("on");
     button.classList.remove("on");
     status.innerText="OFF";
@@ -370,109 +637,186 @@ async function refreshState(){
     const response=await fetch("/api/state",{cache:"no-store"});
     if(!response.ok)return;
     updateScreen(await response.json());
-  }catch(error){console.log("State error:",error)}
+  }
+  catch(error){
+    console.log("State error:",error);
+  }
 }
 
 async function sendSetVoltage(){
   const input=document.getElementById("voltageInput");
   let voltage=parseFloat(input.value);
-  if(isNaN(voltage)){await refreshState();return;}
+
+  if(isNaN(voltage)){
+    await refreshState();
+    return;
+  }
+
   voltage=Math.max(0,Math.min(80,voltage));
   input.value=voltage.toFixed(1);
+
   try{
-    await fetch("/api/set?voltage="+encodeURIComponent(voltage),{cache:"no-store"});
+    await fetch(
+      "/api/set?voltage="+encodeURIComponent(voltage),
+      {cache:"no-store"}
+    );
     await refreshState();
-  }catch(error){console.log("SET error:",error)}
+  }
+  catch(error){
+    console.log("SET error:",error);
+  }
 }
 
 async function togglePower(){
   try{
-    await fetch("/api/power?state="+(hvOn?0:1),{cache:"no-store"});
+    await fetch(
+      "/api/power?state="+(hvOn?0:1),
+      {cache:"no-store"}
+    );
     await refreshState();
-  }catch(error){console.log("Power error:",error)}
+  }
+  catch(error){
+    console.log("Power error:",error);
+  }
 }
 
 const voltageInput=document.getElementById("voltageInput");
+
 voltageInput.addEventListener("change",sendSetVoltage);
-voltageInput.addEventListener("keydown",function(event){if(event.key==="Enter")voltageInput.blur();});
+
+voltageInput.addEventListener("keydown",function(event){
+  if(event.key==="Enter"){
+    voltageInput.blur();
+  }
+});
 
 refreshState();
 setInterval(refreshState,500);
 </script>
+
 </body>
 </html>
 )rawliteral";
+
 
 // ============================================================
 // HTTP handlers
 // ============================================================
 
-void handleRoot() {
+void handleRoot()
+{
   server.send_P(200, "text/html", PAGE);
 }
 
-void handleState() {
+
+void handleState()
+{
   String json;
-  json.reserve(320);
+  json.reserve(340);
 
   json += "{";
-  json += "\"setVoltage\":" + String(setVoltage, 2);
-  json += ",\"measuredVoltage\":" + String(measuredVoltage, 3);
-  json += ",\"measuredCurrent\":" + String(measuredCurrent, 5);
-  json += ",\"vSenseRaw\":" + String(vSenseRaw);
-  json += ",\"iSenseRaw\":" + String(iSenseRaw);
-  json += ",\"vSenseMV\":" + String(vSenseMilliVolts);
-  json += ",\"iSenseMV\":" + String(iSenseMilliVolts);
-  json += ",\"dacCurrent\":" + String(currentDacCode);
-  json += ",\"dacTarget\":" + String(targetDacCode);
+
+  json += "\"setVoltage\":";
+  json += String(setVoltage, 2);
+
+  json += ",\"measuredVoltage\":";
+  json += String(measuredVoltage, 3);
+
+  json += ",\"measuredCurrent\":";
+  json += String(measuredCurrent, 5);
+
+  json += ",\"vSenseRaw\":";
+  json += String(vSenseRaw);
+
+  json += ",\"iSenseRaw\":";
+  json += String(iSenseRaw);
+
+  json += ",\"vSenseMV\":";
+  json += String(vSenseMilliVolts);
+
+  json += ",\"iSenseMV\":";
+  json += String(iSenseMilliVolts);
+
+  json += ",\"dacCurrent\":";
+  json += String(currentDacCode);
+
+  json += ",\"dacTarget\":";
+  json += String(targetDacCode);
+
   json += ",\"ramping\":";
-  json += (hvEnabled && currentDacCode != targetDacCode) ? "true" : "false";
+  json +=
+      (hvEnabled && currentDacCode != targetDacCode)
+      ? "true"
+      : "false";
+
   json += ",\"enabled\":";
   json += hvEnabled ? "true" : "false";
+
   json += "}";
 
   server.send(200, "application/json", json);
 }
 
-void handleSetVoltage() {
+
+void handleSetVoltage()
+{
   if (!server.hasArg("voltage")) {
     server.send(400, "text/plain", "Missing voltage");
     return;
   }
 
-  setVoltage = constrain(server.arg("voltage").toFloat(), HV_MIN, HV_MAX);
+  setVoltage = constrain(
+      server.arg("voltage").toFloat(),
+      HV_MIN,
+      HV_MAX
+  );
+
   applySetVoltage();
+
   server.send(200, "text/plain", "OK");
 }
 
-void handlePower() {
+
+void handlePower()
+{
   if (!server.hasArg("state")) {
     server.send(400, "text/plain", "Missing state");
     return;
   }
 
   bool newState = server.arg("state") == "1";
-  if (newState && !hvEnabled) turnHVOn();
-  if (!newState && hvEnabled) turnHVOff();
+
+  if (newState && !hvEnabled) {
+    turnHVOn();
+  }
+
+  if (!newState && hvEnabled) {
+    turnHVOff();
+  }
 
   server.send(200, "text/plain", "OK");
 }
 
-void handleNotFound() {
+
+void handleNotFound()
+{
   server.send(404, "text/plain", "Not found");
 }
 
+
 // ============================================================
-// Setup / loop
+// Setup
 // ============================================================
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(200);
 
   Serial.println();
   Serial.println("================================");
   Serial.println(" HVunit ESP32 / LT3482");
+  Serial.println(" HV calibration v1");
   Serial.println(" HV module supply: 3.3 V");
   Serial.println("================================");
 
@@ -481,49 +825,66 @@ void setup() {
   pinMode(VSENSE_PIN, INPUT);
   pinMode(ISENSE_PIN, INPUT);
 
-  // Safe startup: converter disabled and CTRL = 0.
+  // Safe startup.
   digitalWrite(SHDN_PIN, LOW);
   setHVLed(false);
   dacWrite(CTRL_DAC_PIN, 0);
+
   hvEnabled = false;
   setVoltage = 0.0f;
   currentDacCode = 0;
   targetDacCode = 0;
 
+  // ADC configuration.
   analogReadResolution(12);
 
-  // This spelling matches the Arduino-ESP32 core currently used on
-  // the development PC. GPIO34/35 are ADC1 pins and remain usable
-  // while Wi-Fi is active.
-  analogSetPinAttenuation(VSENSE_PIN, ADC_11db);
-  analogSetPinAttenuation(ISENSE_PIN, ADC_11db);
+  analogSetPinAttenuation(
+      VSENSE_PIN,
+      ADC_11db
+  );
 
+  analogSetPinAttenuation(
+      ISENSE_PIN,
+      ADC_11db
+  );
+
+  // Wi-Fi access point.
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
 
   if (WiFi.softAP(AP_SSID, AP_PASSWORD)) {
     Serial.println("Wi-Fi AP started");
-  } else {
+  }
+  else {
     Serial.println("Wi-Fi AP ERROR");
   }
 
   Serial.print("SSID: ");
   Serial.println(AP_SSID);
+
   Serial.print("IP:   ");
   Serial.println(WiFi.softAPIP());
 
+  // HTTP server.
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/state", HTTP_GET, handleState);
   server.on("/api/set", HTTP_GET, handleSetVoltage);
   server.on("/api/power", HTTP_GET, handlePower);
   server.onNotFound(handleNotFound);
+
   server.begin();
 
   Serial.println("HTTP server started");
   Serial.println("Open http://192.168.4.1");
 }
 
-void loop() {
+
+// ============================================================
+// Main loop
+// ============================================================
+
+void loop()
+{
   server.handleClient();
   updateMeasurements();
   updateDacRamp();
